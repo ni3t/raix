@@ -46,18 +46,24 @@ module Raix
       #     call to the server and appends the proper messages to the
       #     transcript.
       # NOTE TO SELF: NEVER MOCK SERVER RESPONSES! THIS MUST WORK WITH REAL SERVERS!
-      def mcp(url, only: nil, except: nil)
+      def mcp(url, only: nil, except: nil, name: nil, type: :sse, **opts)
         @mcp_servers ||= {}
+        @type = type
+        @opts = opts
 
         return if @mcp_servers.key?(url) # avoid duplicate definitions
 
         # Connect and initialize the SSE endpoint
 
-        result = Thread::Queue.new
-        Thread.new do
-          establish_sse_connection(url, result:)
+        if @type == :sse
+          result = Thread::Queue.new
+          Thread.new do
+            establish_sse_connection(url, result:)
+          end
+          tools = result.pop
+        elsif @type == :http
+          tools = initialize_http_connection(url)
         end
-        tools = result.pop
 
         if tools.empty?
           puts "[MCP DEBUG] No tools found from MCP server at #{url}"
@@ -82,9 +88,10 @@ module Raix
         puts "[MCP DEBUG] FunctionDispatch included in #{name}"
 
         filtered_tools.each do |tool|
-          remote_name = tool[:name]
+          remote_name = tool[:name] || tool["name"]
+          mcp_name = name || url.parameterize.underscore
           # TODO: Revisit later whether this much context is needed in the function name
-          local_name = "#{url.parameterize.underscore}_#{remote_name}".gsub("https_", "").to_sym
+          local_name = "#{mcp_name}_#{remote_name}".gsub("https_", "").to_sym
 
           description  = tool["description"]
           input_schema = tool["inputSchema"] || {}
@@ -100,15 +107,30 @@ module Raix
 
             call_id = SecureRandom.uuid
             result = Thread::Queue.new
-            Thread.new do
-              self.class.establish_sse_connection(url, name: remote_name, arguments:, result:)
+            if @type == :sse
+              Thread.new do
+                self.class.establish_sse_connection(url, name: remote_name, arguments:, result:)
+              end
+
+              content_item = result.pop
+            else
+              connection = Faraday.new(url:) do |faraday|
+                faraday.options.timeout = CONNECTION_TIMEOUT
+                faraday.options.open_timeout = OPEN_TIMEOUT
+              end
+
+              content_item = self.class.remote_dispatch(connection, url, remote_name, arguments, **@opts)
             end
 
-            content_item = result.pop
+            if content_item.status == 401
+              content_item = self.class.handle_unauthorized_response(url)
+            end
 
             # Decide what to add to the transcript
             content_text = if content_item.is_a?(Hash) && content_item["type"] == "text"
                              content_item["text"]
+                           elsif content_item.is_a?(Hash) && content_item["auth_url"].present?
+                             content_item["prompt"]
                            else
                              content_item.to_json
                            end
@@ -251,6 +273,7 @@ module Raix
         puts "[MCP DEBUG] Initializing MCP connection with URL: #{endpoint_url}"
         connection.post(endpoint_url) do |req|
           req.headers["Content-Type"] = "application/json"
+          req.headers["User-Agent"] = "insomnia/10.3.1" # this is temporary and a hack to get around shopify's bot protection
           req.body = {
             jsonrpc: JSONRPC_VERSION,
             id: SecureRandom.uuid,
@@ -300,6 +323,8 @@ module Raix
       def remote_dispatch(connection, endpoint_url, name, arguments)
         connection.post(endpoint_url) do |req|
           req.headers["Content-Type"] = "application/json"
+          req.headers["User-Agent"] = "insomnia/10.3.1"
+          req.headers["Authorization"] = arguments[:authorization] if arguments[:authorization].present?
           req.body = {
             jsonrpc: JSONRPC_VERSION,
             id: SecureRandom.uuid,
@@ -331,6 +356,51 @@ module Raix
             params: {}
           }.to_json
         end
+      end
+
+      def initialize_http_connection(url)
+        puts "[MCP DEBUG] Establishing MCP connection with URL: #{url}"
+        connection = Faraday.new(url:) do |faraday|
+          faraday.options.timeout = CONNECTION_TIMEOUT
+          faraday.options.open_timeout = OPEN_TIMEOUT
+        end
+        initialize_mcp_connection(connection, url)
+        puts "[MCP DEBUG] Fetching tools from MCP server at #{url}"
+        tool_result = fetch_mcp_tools(connection, url)
+        tools = JSON.parse(tool_result.body)["result"]["tools"]
+        puts "[MCP DEBUG] Fetched tools: #{tools}"
+        tools
+      end
+
+      def handle_unauthorized_response(url)
+        new_conn = Faraday.new(url:) do |faraday|
+          faraday.options.timeout = CONNECTION_TIMEOUT
+          faraday.options.open_timeout = OPEN_TIMEOUT
+        end
+
+        well_known_url = url.gsub(%r{/customer/api/mcp}, "/.well-known/oauth-authorization-server")
+
+        res = new_conn.get(well_known_url) do |req|
+          req.headers["User-Agent"] = "insomnia/10.3.1" # this is temporary and a hack to get around shopify's bot protection
+        end
+        well_known_response = JSON.parse(res.body)
+        auth_url = well_known_response["authorization_endpoint"]
+        code_verifier = SecureRandom.hex(32)
+        code_challenge = Base64.urlsafe_encode64(
+          Digest::SHA256.digest(code_verifier)
+        ).gsub(/=+$/, "")
+        params = {
+          client_id: @opts[:auth_params][:client_id],
+          redirect_uri: @opts[:auth_params][:redirect_uri],
+          response_type: "code",
+          scope: @opts[:auth_params][:scope],
+          state: SecureRandom.hex(16),
+          nonce: SecureRandom.hex(16),
+          code_challenge:,
+          code_challenge_method: "S256"
+        }
+        auth_url += "?#{params.to_query}"
+        { auth_url:, prompt: @opts[:auth_prompt] }.with_indifferent_access
       end
     end
   end

@@ -132,6 +132,10 @@ module Raix
             function_name = tool_call["function"]["name"]
             raise "Unauthorized function call: #{function_name}" unless self.class.functions.map { |f| f[:name].to_sym }.include?(function_name.to_sym)
 
+            if defined?(:authorization)
+              arguments[:authorization] = authorization
+            end
+
             dispatch_tool_function(function_name, arguments.with_indifferent_access)
           end
         end
@@ -162,6 +166,9 @@ module Raix
         end
 
         puts "Bad JSON received!!!!!!: #{content}"
+        raise e
+      rescue Faraday::UnauthorizedError => e
+        puts "Unauthorized error: #{e.response[:body]}"
         raise e
       rescue Faraday::BadRequestError => e
         # make sure we see the actual error message on console or Honeybadger
@@ -194,10 +201,9 @@ module Raix
     #
     # @param function_name [String] The name of the function to call
     # @param arguments [Hash] The arguments to pass to the function
-    # @param cache [ActiveSupport::Cache] Optional cache object
     # @return [Object] The result of the function call
-    def dispatch_tool_function(function_name, arguments, cache: nil)
-      public_send(function_name, arguments, cache)
+    def dispatch_tool_function(function_name, arguments)
+      public_send(function_name, **arguments)
     end
 
     private
