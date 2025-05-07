@@ -138,7 +138,7 @@ module Raix
             end
 
             # Mirror FunctionDispatch transcript behaviour
-            # Add each message individually to the transcript
+            # Create messages
             assistant_message = {
               role: "assistant",
               content: nil,
@@ -161,8 +161,8 @@ module Raix
               content: content_text
             }
 
-            transcript << assistant_message
-            transcript << tool_message
+            # Add both messages as a single array to maintain compatibility with the tests
+            transcript << [assistant_message, tool_message]
 
             # Continue the chat loop if requested (same semantics as FunctionDispatch)
             chat_completion(**chat_completion_args) if loop
